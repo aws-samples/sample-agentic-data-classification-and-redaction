@@ -1,0 +1,273 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AgentCore resources for the Data Classification demo.
+  Deploy in two phases: first without targets (DeployTargets=false),
+  then with targets (DeployTargets=true) after Gateway exists.
+
+Parameters:
+  AgentEcrUri:
+    Type: String
+    Description: ECR image URI for the agent container (account.dkr.ecr.region.amazonaws.com/repo:tag)
+
+  DataRetrievalToolArn:
+    Type: String
+    Description: ARN of the DataRetrievalTool Lambda
+
+  DocumentSearchToolArn:
+    Type: String
+    Description: ARN of the DocumentSearchTool Lambda
+
+  ClassificationLookupToolArn:
+    Type: String
+    Description: ARN of the ClassificationLookupTool Lambda
+
+  DeployTargets:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Set to true on second deploy to add GatewayTargets
+
+Conditions:
+  ShouldDeployTargets: !Equals [!Ref DeployTargets, 'true']
+
+Resources:
+  # ============================================================
+  # AgentCore - IAM Role for the Runtime
+  # ============================================================
+  AgentCoreRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: data-classification-demo-agentcore-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AgentCoreRuntimePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Ref DataRetrievalToolArn
+                  - !Ref DocumentSearchToolArn
+                  - !Ref ClassificationLookupToolArn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ============================================================
+  # AgentCore - Runtime (Container on ECR)
+  # ============================================================
+  AgentCoreRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: DataClassificationDemoAgent
+      Description: Research Assistant agent for classified document search and retrieval
+      RoleArn: !GetAtt AgentCoreRuntimeRole.Arn
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref AgentEcrUri
+      EnvironmentVariables:
+        REGION: !Sub '${AWS::Region}'
+
+  # ============================================================
+  # AgentCore - Memory (short-term session memory)
+  # ============================================================
+  AgentCoreMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    Properties:
+      Name: DataClassificationDemoMemory
+      Description: Short-term session memory for multi-turn conversation
+      EventExpiryDuration: 7
+
+  # ============================================================
+  # AgentCore - Gateway (MCP interface for tools, with Guardrails)
+  # ============================================================
+  AgentCoreGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: DataClassificationDemoGateway
+      ProtocolType: MCP
+      AuthorizerType: AWS_IAM
+      RoleArn: !GetAtt AgentCoreRuntimeRole.Arn
+      PolicyEngineConfiguration:
+        Arn: !GetAtt AgentCorePolicyEngine.PolicyEngineArn
+        Mode: ENFORCE
+
+  # ============================================================
+  # AgentCore - Policy Engine + Policies
+  # PII masking is handled by Bedrock Guardrails ApplyGuardrail API
+  # in the tool Lambda (ANONYMIZE action → {EMAIL}, {NAME} placeholders).
+  # PolicyEngine is in ENFORCE mode for access control.
+  # ============================================================
+  AgentCorePolicyEngine:
+    Type: AWS::BedrockAgentCore::PolicyEngine
+    Properties:
+      Name: DataClassificationDemoPolicyEngine
+      Description: Policy engine with Guardrails safety net for PII leakage
+
+  PolicyPermitAll:
+    Type: AWS::BedrockAgentCore::Policy
+    Properties:
+      Name: DataClassificationDemoPermitAll
+      PolicyEngineId: !GetAtt AgentCorePolicyEngine.PolicyEngineId
+      Description: Baseline permit policy allowing gateway access
+      EnforcementMode: ACTIVE
+      ValidationMode: IGNORE_ALL_FINDINGS
+      Definition:
+        Policy:
+          Statement: 'permit (principal, action, resource is AgentCore::Gateway);'
+
+  # ============================================================
+  # AgentCore - Gateway Targets (Lambda tools via MCP)
+  # Added on second deploy after Gateway exists.
+  # ============================================================
+  GatewayTargetDataRetrieval:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Condition: ShouldDeployTargets
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: DataRetrievalTarget
+      Description: Retrieves classified content with MNPI entitlement enforcement
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !Ref DataRetrievalToolArn
+            ToolSchema:
+              InlinePayload:
+                - Name: retrieve_document
+                  Description: >-
+                    Retrieve the full content of a classified document by its content_id.
+                    Returns the document text with MNPI redaction applied based on user entitlements.
+                    PII is suppressed by Guardrails at the gateway level.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      content_id:
+                        Type: string
+                        Description: The unique identifier (UUID) of the document to retrieve
+                      user_id:
+                        Type: string
+                        Description: The requesting user's ID for entitlement-based MNPI redaction
+                    Required:
+                      - content_id
+                      - user_id
+                  OutputSchema:
+                    Type: object
+                    Properties:
+                      text:
+                        Type: string
+                        Description: The document text content (after MNPI redaction)
+
+  GatewayTargetDocumentSearch:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Condition: ShouldDeployTargets
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: DocumentSearchTarget
+      Description: Semantic k-NN search across classified documents
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !Ref DocumentSearchToolArn
+            ToolSchema:
+              InlinePayload:
+                - Name: search_documents
+                  Description: >-
+                    Search for classified documents matching a natural language query.
+                    Uses semantic search (vector similarity via OpenSearch k-NN) to find relevant documents.
+                    Results are filtered by security clearance and MNPI is redacted per entitlements.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      query:
+                        Type: string
+                        Description: Natural language description of what to search for
+                      user_id:
+                        Type: string
+                        Description: The requesting user's ID for entitlement-based filtering
+                    Required:
+                      - query
+                      - user_id
+
+  GatewayTargetClassificationLookup:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Condition: ShouldDeployTargets
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: ClassificationLookupTarget
+      Description: Returns classification metadata for a document
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !Ref ClassificationLookupToolArn
+            ToolSchema:
+              InlinePayload:
+                - Name: lookup_classification
+                  Description: >-
+                    Look up the classification metadata for a specific document.
+                    Returns MNPI status, PII types detected, security level, and classification reasoning.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      content_id:
+                        Type: string
+                        Description: The unique identifier (UUID) of the document
+                    Required:
+                      - content_id
+
+Outputs:
+  AgentRuntimeArn:
+    Description: AgentCore Runtime ARN
+    Value: !GetAtt AgentCoreRuntime.AgentRuntimeArn
+
+  AgentRuntimeId:
+    Description: AgentCore Runtime ID
+    Value: !GetAtt AgentCoreRuntime.AgentRuntimeId
+
+  GatewayUrl:
+    Description: AgentCore Gateway URL (MCP endpoint for tools)
+    Value: !GetAtt AgentCoreGateway.GatewayUrl
+
+  GatewayId:
+    Description: AgentCore Gateway Identifier
+    Value: !GetAtt AgentCoreGateway.GatewayIdentifier
+
+  MemoryId:
+    Description: AgentCore Memory ID
+    Value: !GetAtt AgentCoreMemory.MemoryId

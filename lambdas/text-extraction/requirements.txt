@@ -1,0 +1,2 @@
+boto3>=1.34.0
+defusedxml>=0.7.0

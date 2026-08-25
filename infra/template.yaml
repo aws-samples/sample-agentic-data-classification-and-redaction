@@ -1,0 +1,1086 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Agentic Data Classification and Redaction - Infrastructure
+  Deploys the ingestion pipeline, classification engine, storage layer,
+  agent tool Lambdas, frontend hosting, and observability stack.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: demo
+    AllowedValues: [demo, dev, prod]
+    Description: Deployment environment
+
+  ProjectName:
+    Type: String
+    Default: data-classification
+    Description: Project name used for resource naming
+
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+    Description: Bedrock model ID for classification
+
+
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing packaged Lambda code zips
+
+Resources:
+  # ============================================================
+  # KMS - Encryption Key
+  # ============================================================
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${ProjectName}-${Environment} encryption key'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowServiceUsage
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - s3.amazonaws.com
+                - dynamodb.amazonaws.com
+                - sqs.amazonaws.com
+                - logs.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+              - kms:Encrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}'
+      TargetKeyId: !Ref EncryptionKey
+
+  # ============================================================
+  # S3 - Landing Bucket (raw content upload)
+  # ============================================================
+  LandingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-landing-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref EncryptionKey
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # ============================================================
+  # S3 - Processed Bucket (extracted text + classified content)
+  # ============================================================
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-processed-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref EncryptionKey
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ============================================================
+  # S3 - Frontend Hosting Bucket
+  # ============================================================
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-frontend-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ============================================================
+  # Bedrock Guardrail - PII Masking (ANONYMIZE)
+  # Used by tool Lambdas via ApplyGuardrail API to mask PII tokens
+  # ============================================================
+  PiiGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-pii-masking'
+      Description: Masks PII in document content with anonymized placeholders
+      BlockedInputMessaging: This request contains sensitive information that cannot be processed.
+      BlockedOutputsMessaging: The response contained sensitive information that has been masked.
+      SensitiveInformationPolicyConfig:
+        PiiEntitiesConfig:
+          - Type: EMAIL
+            Action: ANONYMIZE
+          - Type: PHONE
+            Action: ANONYMIZE
+          - Type: US_SOCIAL_SECURITY_NUMBER
+            Action: ANONYMIZE
+          - Type: NAME
+            Action: ANONYMIZE
+          - Type: ADDRESS
+            Action: ANONYMIZE
+          - Type: CREDIT_DEBIT_CARD_NUMBER
+            Action: ANONYMIZE
+
+  PiiGuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt PiiGuardrail.GuardrailId
+      Description: Initial version
+
+  # ============================================================
+  # DynamoDB - Classification Metadata Table
+  # ============================================================
+  ClassificationMetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-classification-metadata'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      AttributeDefinitions:
+        - AttributeName: content_id
+          AttributeType: S
+        - AttributeName: security_level
+          AttributeType: S
+        - AttributeName: classified_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: content_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: security-level-index
+          KeySchema:
+            - AttributeName: security_level
+              KeyType: HASH
+            - AttributeName: classified_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ============================================================
+  # DynamoDB - Entitlement Policies Table
+  # ============================================================
+  EntitlementPoliciesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-entitlement-policies'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref EncryptionKey
+      AttributeDefinitions:
+        - AttributeName: principal_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: principal_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ============================================================
+  # SQS - Classification Queue
+  # ============================================================
+  ClassificationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-classification-dlq'
+      KmsMasterKeyId: !Ref EncryptionKey
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  ClassificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-classification-queue'
+      KmsMasterKeyId: !Ref EncryptionKey
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400  # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ClassificationDLQ.Arn
+        maxReceiveCount: 3
+
+  # ============================================================
+  # OpenSearch Serverless - Vector Search Collection
+  # ============================================================
+  OpenSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-enc'
+      Type: encryption
+      Policy: !Sub |
+        {
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${ProjectName}-${Environment}-vectors"]
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  OpenSearchNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-net'
+      Type: network
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${ProjectName}-${Environment}-vectors"]
+              },
+              {
+                "ResourceType": "dashboard",
+                "Resource": ["collection/${ProjectName}-${Environment}-vectors"]
+              }
+            ],
+            "AllowFromPublic": true
+          }
+        ]
+
+  OpenSearchDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-access'
+      Type: data
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${ProjectName}-${Environment}-vectors"],
+                "Permission": ["aoss:CreateCollectionItems", "aoss:UpdateCollectionItems", "aoss:DescribeCollectionItems"]
+              },
+              {
+                "ResourceType": "index",
+                "Resource": ["index/${ProjectName}-${Environment}-vectors/*"],
+                "Permission": ["aoss:CreateIndex", "aoss:UpdateIndex", "aoss:DescribeIndex", "aoss:ReadDocument", "aoss:WriteDocument"]
+              }
+            ],
+            "Principal": [
+              "${ClassificationRole.Arn}",
+              "${DataRetrievalToolRole.Arn}",
+              "${DocumentSearchToolRole.Arn}",
+              "arn:aws:iam::${AWS::AccountId}:root"
+            ]
+          }
+        ]
+
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - OpenSearchEncryptionPolicy
+      - OpenSearchNetworkPolicy
+      - OpenSearchDataAccessPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-vectors'
+      Type: VECTORSEARCH
+      Description: Vector search index for classified content (k-NN semantic search)
+
+  # ============================================================
+  # EventBridge - S3 Upload Rule
+  # ============================================================
+  S3UploadRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-s3-upload'
+      Description: Triggers text extraction when content is uploaded to landing bucket
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref LandingBucket
+          object:
+            key:
+              - prefix: 'raw/'
+      Targets:
+        - Id: TextExtractionLambda
+          Arn: !GetAtt TextExtractionFunction.Arn
+
+  TextExtractionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TextExtractionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3UploadRule.Arn
+
+  # ============================================================
+  # Lambda - Text Extraction
+  # ============================================================
+  TextExtractionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-text-extraction-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TextExtractionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${LandingBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${ProcessedBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt ClassificationQueue.Arn
+              - Effect: Allow
+                Action:
+                  - textract:DetectDocumentText
+                  - textract:AnalyzeDocument
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey*
+                Resource: !GetAtt EncryptionKey.Arn
+
+  TextExtractionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-text-extraction'
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: lambdas/text-extraction.zip
+      Handler: handler.lambda_handler
+      Runtime: python3.13
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt TextExtractionRole.Arn
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          CLASSIFICATION_QUEUE_URL: !Ref ClassificationQueue
+
+  # ============================================================
+  # Lambda - Classification
+  # ============================================================
+  ClassificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-classification-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ClassificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${ProcessedBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt ClassificationMetadataTable.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ClassificationQueue.Arn
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey*
+                Resource: !GetAtt EncryptionKey.Arn
+
+  ClassificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-classification'
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: lambdas/classification.zip
+      Handler: handler.lambda_handler
+      Runtime: python3.13
+      Timeout: 300
+      MemorySize: 1024
+      Role: !GetAtt ClassificationRole.Arn
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          CLASSIFICATION_TABLE: !Ref ClassificationMetadataTable
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+          OPENSEARCH_INDEX: classified-content
+
+  ClassificationEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ClassificationQueue.Arn
+      FunctionName: !GetAtt ClassificationFunction.Arn
+      BatchSize: 1
+
+  # ============================================================
+  # Lambda - Data Retrieval Tool (Gateway Target)
+  # ============================================================
+  DataRetrievalToolRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-data-retrieval-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DataRetrievalPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt ClassificationMetadataTable.Arn
+                  - !Sub '${ClassificationMetadataTable.Arn}/index/*'
+                  - !GetAtt EntitlementPoliciesTable.Arn
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt EncryptionKey.Arn
+              - Effect: Allow
+                Action:
+                  - bedrock:ApplyGuardrail
+                Resource: !GetAtt PiiGuardrail.GuardrailArn
+
+  DataRetrievalToolFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-data-retrieval-tool'
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: lambdas/data-retrieval-tool.zip
+      Handler: handler.lambda_handler
+      Runtime: python3.13
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt DataRetrievalToolRole.Arn
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          CLASSIFICATION_TABLE: !Ref ClassificationMetadataTable
+          ENTITLEMENT_TABLE: !Ref EntitlementPoliciesTable
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+          OPENSEARCH_INDEX: classified-content
+          GUARDRAIL_ID: !GetAtt PiiGuardrail.GuardrailId
+          GUARDRAIL_VERSION: !GetAtt PiiGuardrailVersion.Version
+
+  # ============================================================
+  # Lambda - Document Search Tool (Gateway Target)
+  # ============================================================
+  DocumentSearchToolRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-doc-search-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DocumentSearchPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ClassificationMetadataTable.Arn
+                  - !Sub '${ClassificationMetadataTable.Arn}/index/*'
+                  - !GetAtt EntitlementPoliciesTable.Arn
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt EncryptionKey.Arn
+
+  DocumentSearchToolFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-doc-search-tool'
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: lambdas/document-search-tool.zip
+      Handler: handler.lambda_handler
+      Runtime: python3.13
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt DocumentSearchToolRole.Arn
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          CLASSIFICATION_TABLE: !Ref ClassificationMetadataTable
+          ENTITLEMENT_TABLE: !Ref EntitlementPoliciesTable
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+          OPENSEARCH_INDEX: classified-content
+
+  # ============================================================
+  # Lambda - Classification Lookup Tool (Gateway Target)
+  # ============================================================
+  ClassificationLookupToolRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-class-lookup-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ClassificationLookupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt ClassificationMetadataTable.Arn
+                  - !Sub '${ClassificationMetadataTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt EncryptionKey.Arn
+
+  ClassificationLookupToolFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-class-lookup-tool'
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: lambdas/classification-lookup-tool.zip
+      Handler: handler.lambda_handler
+      Runtime: python3.13
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt ClassificationLookupToolRole.Arn
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          CLASSIFICATION_TABLE: !Ref ClassificationMetadataTable
+
+  # ============================================================
+  # Lambda - Backend API (Frontend → AgentCore proxy)
+  # ============================================================
+  BackendApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-backend-api-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BackendApiPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                  - bedrock-agentcore:InvokeAgentRuntimeForUser
+                  - bedrock-agentcore:InvokeAgentRuntimeWithWebSocketStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt ClassificationMetadataTable.Arn
+                  - !Sub '${ClassificationMetadataTable.Arn}/index/*'
+                  - !GetAtt EntitlementPoliciesTable.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt EncryptionKey.Arn
+
+  BackendApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-backend-api'
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: lambdas/backend-api.zip
+      Handler: handler.lambda_handler
+      Runtime: python3.13
+      Timeout: 300
+      MemorySize: 1024
+      Role: !GetAtt BackendApiRole.Arn
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          CLASSIFICATION_TABLE: !Ref ClassificationMetadataTable
+          ENTITLEMENT_TABLE: !Ref EntitlementPoliciesTable
+
+  # ============================================================
+  # Cognito - User Pool for Demo Users
+  # ============================================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-${Environment}-users'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+        - Name: custom:role
+          AttributeDataType: String
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-${Environment}-frontend'
+      UserPoolId: !Ref UserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      GenerateSecret: false  # pragma: allowlist secret (Cognito config flag, not a secret value)
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # ============================================================
+  # API Gateway - HTTP API for Frontend
+  # ============================================================
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - X-User-Id
+        MaxAge: 300
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt BackendApiFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: '$default'
+      Target: !Sub 'integrations/${HttpApiIntegration}'
+
+  BackendApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackendApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+  # ============================================================
+  # CloudFront Distribution
+  # ============================================================
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-${Environment}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+          - Id: ApiOrigin
+            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            ForwardedValues:
+              QueryString: true
+              Headers:
+                - Authorization
+                - Content-Type
+                - X-User-Id
+              Cookies:
+                Forward: none
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # ============================================================
+  # CloudWatch - Log Groups
+  # ============================================================
+  TextExtractionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-text-extraction'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  ClassificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-classification'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  DataRetrievalLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-data-retrieval-tool'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  DocumentSearchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-doc-search-tool'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  BackendApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-${Environment}-backend-api'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  # ============================================================
+  # CloudWatch - Dashboard
+  # ============================================================
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${Environment}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Classification Pipeline",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-${Environment}-classification"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-${Environment}-classification"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-${Environment}-classification"]
+                ],
+                "region": "${AWS::Region}",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Text Extraction",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-${Environment}-text-extraction"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ProjectName}-${Environment}-text-extraction"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-${Environment}-text-extraction"]
+                ],
+                "region": "${AWS::Region}",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "SQS Classification Queue",
+                "metrics": [
+                  ["AWS/SQS", "NumberOfMessagesSent", "QueueName", "${ProjectName}-${Environment}-classification-queue"],
+                  ["AWS/SQS", "NumberOfMessagesReceived", "QueueName", "${ProjectName}-${Environment}-classification-queue"],
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${ProjectName}-${Environment}-classification-queue"]
+                ],
+                "region": "${AWS::Region}",
+                "period": 60
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Agent Tool Invocations",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-${Environment}-data-retrieval-tool"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-${Environment}-doc-search-tool"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-${Environment}-class-lookup-tool"]
+                ],
+                "region": "${AWS::Region}",
+                "period": 60
+              }
+            }
+          ]
+        }
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  LandingBucketName:
+    Description: S3 bucket for raw content upload
+    Value: !Ref LandingBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-landing-bucket'
+
+  ProcessedBucketName:
+    Description: S3 bucket for processed/classified content
+    Value: !Ref ProcessedBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-processed-bucket'
+
+  ClassificationTableName:
+    Description: DynamoDB table for classification metadata
+    Value: !Ref ClassificationMetadataTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-classification-table'
+
+  EntitlementTableName:
+    Description: DynamoDB table for entitlement policies
+    Value: !Ref EntitlementPoliciesTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-entitlement-table'
+
+  ClassificationQueueUrl:
+    Description: SQS queue URL for classification pipeline
+    Value: !Ref ClassificationQueue
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain for the demo UI
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  ApiEndpoint:
+    Description: HTTP API endpoint
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+
+  EncryptionKeyArn:
+    Description: KMS key ARN
+    Value: !GetAtt EncryptionKey.Arn
+
+  OpenSearchEndpoint:
+    Description: OpenSearch Serverless collection endpoint
+    Value: !GetAtt OpenSearchCollection.CollectionEndpoint
+
+  OpenSearchCollectionArn:
+    Description: OpenSearch Serverless collection ARN
+    Value: !GetAtt OpenSearchCollection.Arn
+
+
+  DataRetrievalToolFunctionArn:
+    Description: ARN of the DataRetrievalTool Lambda
+    Value: !GetAtt DataRetrievalToolFunction.Arn
+
+  DocumentSearchToolFunctionArn:
+    Description: ARN of the DocumentSearchTool Lambda
+    Value: !GetAtt DocumentSearchToolFunction.Arn
+
+  ClassificationLookupToolFunctionArn:
+    Description: ARN of the ClassificationLookupTool Lambda
+    Value: !GetAtt ClassificationLookupToolFunction.Arn
