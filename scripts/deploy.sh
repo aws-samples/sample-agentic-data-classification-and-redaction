@@ -204,6 +204,14 @@ echo "Step 6: Seeding entitlement policies..."
 cd "${ROOT_DIR}"
 python3 scripts/seed-entitlements.py "${ENVIRONMENT}"
 
+# Step 6b: Seed the externalized classification prompt (Bedrock Prompt Management)
+# Creates/updates the managed MNPI classification prompt and publishes its ARN
+# to SSM so the Classification Lambda can look it up. Editing the MNPI rules
+# later is done in the Bedrock console (Prompt management) with no redeploy.
+echo ""
+echo "Step 6b: Seeding classification prompt (Bedrock Prompt Management)..."
+python3 scripts/seed-classification-prompt.py "${ENVIRONMENT}" "us.anthropic.claude-sonnet-4-6"
+
 # Step 7: Build and deploy frontend
 echo ""
 echo "Step 7: Building and deploying frontend..."

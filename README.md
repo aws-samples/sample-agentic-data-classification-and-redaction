@@ -13,11 +13,13 @@ Automated classification of unstructured content (emails, transcripts, web artic
 **1. Classification Pipeline (async, at ingestion)**
 ```
 PDF Upload → S3 Landing → EventBridge → Text Extraction Lambda (Textract)
-  → SQS → Classification Lambda (Bedrock Claude) → DynamoDB (metadata)
+  → SQS → Classification Lambda (Bedrock Claude via managed prompt) → DynamoDB (metadata)
                                                   → Titan Embeddings (embed)
                                                   → OpenSearch Serverless k-NN (index full text + vector)
                                                   → S3 Processed (audit copy)
 ```
+
+Note: The classification prompt is externalized to **Amazon Bedrock Prompt Management** (see [Evolving the Classification Rules](#evolving-the-classification-rules)). The Classification Lambda resolves the prompt ARN from SSM Parameter Store at runtime, so the MNPI rules can evolve without a code deployment.
 
 **2. Agent Runtime (sync, at query time)**
 ```
@@ -39,6 +41,7 @@ Note: The backend Lambda is a thin proxy — all intelligence (search, reasoning
 | Service | Purpose |
 |---------|---------|
 | Amazon Bedrock (Claude Sonnet) | Content classification (MNPI/PII/security level) |
+| Amazon Bedrock Prompt Management | Externalized, versionable classification prompt — MNPI rules editable without redeploy |
 | Amazon Bedrock (Titan Embeddings V2) | Document and query embedding (1024-dim vectors) |
 | OpenSearch Serverless (Vector Search) | Semantic k-NN search + full content storage (single query-time data source) |
 | Amazon Textract | PDF text extraction |
@@ -67,6 +70,26 @@ Note: The backend Lambda is a thin proxy — all intelligence (search, reasoning
 | Semantic search | Titan Embeddings + OpenSearch k-NN | Tool Lambda |
 | Reasoning & summarization | Agent system prompt + Claude | AgentCore Runtime |
 | Multi-turn memory | AgentCore Memory (short-term sessions) | AgentCore Runtime |
+
+## Evolving the Classification Rules
+
+MNPI is a moving target — what qualifies as material non-public information changes over time. To avoid a code deployment every time the rules change, the classification prompt is externalized to **Amazon Bedrock Prompt Management** instead of being hardcoded in the Lambda.
+
+**How it works:**
+- `scripts/seed-classification-prompt.py` creates (or updates) a managed prompt named `data-classification-<env>-classification` and publishes its ARN to SSM Parameter Store at `/data-classification/<env>/classification-prompt-arn`. This runs automatically during `deploy.sh`.
+- The prompt owns both the **model ID** and the **inference configuration** (temperature, max tokens), so you can swap models or tune inference without touching Lambda code.
+- At runtime the Classification Lambda reads the ARN from SSM (cached) and invokes the prompt's **DRAFT** version via the Bedrock Converse API. Because it targets DRAFT, edits go live immediately.
+
+**To change the MNPI rules (no redeployment):**
+1. Open the Amazon Bedrock console → **Prompt management**.
+2. Select `data-classification-<env>-classification` and edit the prompt draft (or its model / inference settings).
+3. Save. The next document classified picks up the change automatically.
+
+Alternatively, edit `CLASSIFICATION_PROMPT_TEXT` in `scripts/seed-classification-prompt.py` and re-run it to update the draft from source control.
+
+**Fallback behavior:** If the managed prompt cannot be resolved or rendered (e.g. the SSM pointer is missing), the Lambda falls back to a trimmed baked-in prompt so classification still runs. If a model response cannot be parsed, the document fails closed to `Restricted` (most restrictive). The authoritative, evolving rules always live in the managed prompt.
+
+> **Note:** The seed script requires the deployer's credentials to have `bedrock:CreatePrompt`, `bedrock:UpdatePrompt`, `bedrock:ListPrompts`, and `ssm:PutParameter` permissions.
 
 ## Demo Users
 
@@ -112,8 +135,9 @@ This single script deploys **everything** via CloudFormation:
    - Gateway Targets (tool Lambdas exposed via MCP)
 5. Configures Runtime environment (Gateway URL, Memory ID)
 6. Seeds user entitlement policies
-7. Builds and uploads the React frontend
-8. Uploads sample PDFs to trigger the classification pipeline
+7. Seeds the externalized classification prompt (Bedrock Prompt Management) and publishes its ARN to SSM
+8. Builds and uploads the React frontend
+9. Uploads sample PDFs to trigger the classification pipeline
 
 ### Step-by-Step (if needed)
 
@@ -146,6 +170,9 @@ aws bedrock-agentcore-control update-agent-runtime --agent-runtime-id <id> ...
 
 # 6. Seed entitlements
 python3 scripts/seed-entitlements.py demo
+
+# 6b. Seed the classification prompt (Bedrock Prompt Management) + publish ARN to SSM
+python3 scripts/seed-classification-prompt.py demo us.anthropic.claude-sonnet-4-6
 
 # 7. Build and deploy frontend
 cd frontend && npm install && npm run build
@@ -184,7 +211,7 @@ See [DEMO-SCRIPT.md](DEMO-SCRIPT.md) for the full walkthrough with 8 scenarios, 
 │   └── template.yaml          # Full stack: S3, DynamoDB, OpenSearch, Lambda, API GW, CloudFront
 ├── lambdas/
 │   ├── text-extraction/        # Extracts text from PDFs via Textract
-│   ├── classification/         # Classifies (Bedrock Claude) + embeds (Titan) + indexes full text (OpenSearch)
+│   ├── classification/         # Classifies (Bedrock Claude via managed prompt) + embeds (Titan) + indexes full text (OpenSearch)
 │   ├── data-retrieval-tool/    # Gateway target: retrieve from OpenSearch with entitlement check
 │   ├── document-search-tool/   # Gateway target: semantic k-NN search via OpenSearch
 │   ├── classification-lookup-tool/  # Gateway target: metadata lookup from DynamoDB
@@ -196,8 +223,8 @@ See [DEMO-SCRIPT.md](DEMO-SCRIPT.md) for the full walkthrough with 8 scenarios, 
 │   ├── deploy.sh              # One-command full deployment (everything via CloudFormation)
 │   ├── generate-sample-pdfs.py # Creates demo PDFs
 │   ├── seed-entitlements.py   # Seeds user entitlement policies
+│   ├── seed-classification-prompt.py # Seeds/updates the managed classification prompt + SSM pointer
 │   └── upload-sample-data.sh  # Uploads PDFs to trigger pipeline
-├── architecture-diagram.drawio # AWS architecture diagram
 ├── architecture-diagram.png    # Exported PNG of architecture
 ├── DEMO-SCRIPT.md             # Demo walkthrough with test prompts
 └── .kiro/specs/                # Spec documents (requirements, design, tasks)

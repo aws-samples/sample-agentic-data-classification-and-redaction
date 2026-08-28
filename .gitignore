@@ -16,6 +16,9 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Diagram source (kept local; only the exported PNG is committed)
+architecture-diagram.drawio
+
 # IDE
 .vscode/
 .idea/

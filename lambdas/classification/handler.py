@@ -17,10 +17,15 @@ from requests_aws4auth import AWS4Auth
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 bedrock = boto3.client("bedrock-runtime", region_name="us-east-1")
+ssm = boto3.client("ssm", region_name="us-east-1")
 
 PROCESSED_BUCKET = os.environ["PROCESSED_BUCKET"]
 CLASSIFICATION_TABLE = os.environ["CLASSIFICATION_TABLE"]
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-6")
+# SSM parameter holding the ARN of the externalized classification prompt in
+# Bedrock Prompt Management. Populated post-deploy by
+# scripts/seed-classification-prompt.py.
+CLASSIFICATION_PROMPT_PARAM = os.environ.get("CLASSIFICATION_PROMPT_PARAM", "")
 OPENSEARCH_ENDPOINT = os.environ.get("OPENSEARCH_ENDPOINT", "")
 OPENSEARCH_INDEX = os.environ.get("OPENSEARCH_INDEX", "classified-content")
 REGION = "us-east-1"
@@ -28,54 +33,30 @@ EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
 
 table = dynamodb.Table(CLASSIFICATION_TABLE)
 
-CLASSIFICATION_PROMPT = """You are a data classification system for a financial services firm. Analyze the following content and return a JSON classification.
+# Cache the resolved prompt ARN across warm invocations to avoid an SSM call
+# on every message.
+_prompt_arn_cache = None
 
-You MUST assess three dimensions:
+# Trimmed, baked-in fallback prompt. This is ONLY used as a last resort if the
+# externalized managed prompt cannot be resolved or rendered (e.g. SSM pointer
+# missing or Bedrock Prompt Management unavailable). The authoritative,
+# evolving MNPI rules live in the managed prompt (see
+# scripts/seed-classification-prompt.py). This fallback must still emit the same
+# JSON schema so downstream parsing works. It uses a single-brace {content}
+# placeholder filled via str.replace().
+FALLBACK_CLASSIFICATION_PROMPT = """You are a data classification system for a financial services firm. Analyze the content and return ONLY a JSON classification.
 
-1. **MNPI Assessment** — Is this Material Non-Public Information?
-   MNPI means the content itself contains material, non-public financial information that could move a stock price or violate securities regulations if traded upon.
-   
-   IS MNPI:
-   - Specific earnings figures not yet publicly announced
-   - Undisclosed M&A activity, deal terms, or acquisition targets
-   - Client portfolio positions or upcoming allocation changes
-   - Revenue guidance, buyback plans, or financial projections not yet filed/disclosed
-   - Expert insights revealing undisclosed company financials or strategic plans
-   
-   IS NOT MNPI:
-   - Administrative references to compliance processes (e.g., "employee needs wall-crossing", "complete compliance training")
-   - General HR records, onboarding documents, or personnel files — even if they mention company names in an administrative context
-   - Internal scheduling, team standups, or process discussions that don't reveal financial details
-   - Publicly available news articles, press releases, or published research
-   
-   Key distinction: A document that MENTIONS a company name is not MNPI. A document that reveals UNDISCLOSED FINANCIAL DETAILS about that company is MNPI.
-   
-   - mnpi: boolean (true ONLY if the content itself contains material non-public financial information)
-   - mnpi_confidence: float 0.0-1.0 (how confident you are)
-   - mnpi_entities: list of strings (companies/entities the MNPI relates to — only include if actual MNPI about them is present)
-   - mnpi_reasoning: string (brief explanation)
-
-2. **PII Detection** — What personally identifiable information is present?
-   Types to detect: email_address, phone_number, ssn, name, address, financial_account,
-   date_of_birth, ip_address, credit_card
-   - pii_detected: boolean (true if any PII found)
-   - pii_types: list of strings (types of PII found)
-   - pii_entities: list of objects with {type, value, location} for each PII item found
-
-3. **Security Level** — What is the appropriate security classification?
-   - Public: No restrictions, publicly available information
-   - Internal: Firm employees only, general business information
-   - Confidential: Need-to-know basis, sensitive business or personal details (e.g., HR records, salary info)
-   - Restricted: Named individuals only, highly sensitive (contains actual MNPI, client-specific deal terms)
-   - security_level: string (one of Public, Internal, Confidential, Restricted)
-   - security_reasoning: string (brief explanation)
+Assess three dimensions:
+1. MNPI (Material Non-Public Information): true only if the content itself reveals undisclosed, price-sensitive financial information (unannounced earnings, undisclosed M&A/deal terms, client positions, unfiled guidance/buybacks, expert insights on undisclosed financials). Merely mentioning a company name, HR/administrative records, internal scheduling, or public news is NOT MNPI.
+2. PII: detect email_address, phone_number, ssn, name, address, financial_account, date_of_birth, ip_address, credit_card.
+3. Security level: Public, Internal, Confidential (HR/salary/sensitive personal or business), or Restricted (actual MNPI or client-specific deal terms).
 
 Content to classify:
 ---
 {content}
 ---
 
-Return ONLY valid JSON with this exact structure (no markdown, no explanation outside JSON):
+Return ONLY valid JSON with this exact structure (no markdown, no text outside JSON):
 {
   "mnpi": false,
   "mnpi_confidence": 0.0,
@@ -151,22 +132,83 @@ def lambda_handler(event, context):
     return {"statusCode": 200}
 
 
-def classify_content(text):
-    """Call Bedrock Claude to classify the content."""
-    prompt = CLASSIFICATION_PROMPT.replace("{content}", text)
+def get_prompt_arn():
+    """Resolve the externalized classification prompt ARN from SSM (cached)."""
+    global _prompt_arn_cache
+    if _prompt_arn_cache is not None:
+        return _prompt_arn_cache
+    if not CLASSIFICATION_PROMPT_PARAM:
+        return None
+    try:
+        resp = ssm.get_parameter(Name=CLASSIFICATION_PROMPT_PARAM)
+        _prompt_arn_cache = resp["Parameter"]["Value"]
+        return _prompt_arn_cache
+    except Exception as e:
+        print(f"Could not read classification prompt ARN from SSM "
+              f"({CLASSIFICATION_PROMPT_PARAM}): {e}")
+        return None
 
-    response = bedrock.converse(
-        modelId=BEDROCK_MODEL_ID,
-        messages=[{"role": "user", "content": [{"text": prompt}]}],
-        inferenceConfig={"maxTokens": 2048, "temperature": 0.0},
-    )
 
+def _extract_response_text(response):
+    """Concatenate the text blocks from a Converse response."""
     output_message = response["output"]["message"]
     response_text = ""
     for content_block in output_message["content"]:
         if "text" in content_block:
             response_text += content_block["text"]
+    return response_text
 
+
+def invoke_managed_prompt(prompt_arn, text):
+    """Invoke the externalized prompt (DRAFT) from Bedrock Prompt Management.
+
+    The prompt owns the model ID and inference config, so we pass neither here —
+    Converse rejects inferenceConfig when a managed prompt is used.
+    """
+    response = bedrock.converse(
+        modelId=prompt_arn,
+        promptVariables={"content": {"text": text}},
+    )
+    return _extract_response_text(response)
+
+
+def invoke_fallback_prompt(text):
+    """Last-resort classification using the baked-in prompt and direct model call."""
+    prompt = FALLBACK_CLASSIFICATION_PROMPT.replace("{content}", text)
+    response = bedrock.converse(
+        modelId=BEDROCK_MODEL_ID,
+        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        inferenceConfig={"maxTokens": 2048, "temperature": 0.0},
+    )
+    return _extract_response_text(response)
+
+
+def classify_content(text):
+    """Classify content via the managed prompt, falling back to the baked-in prompt.
+
+    Resolution order:
+      1. Externalized managed prompt (Bedrock Prompt Management, auto-live DRAFT).
+      2. Baked-in fallback prompt if the managed prompt can't be resolved/rendered.
+    On a response that can't be parsed as JSON, fail closed to Restricted.
+    """
+    response_text = None
+
+    prompt_arn = get_prompt_arn()
+    if prompt_arn:
+        try:
+            response_text = invoke_managed_prompt(prompt_arn, text)
+        except Exception as e:
+            print(f"Managed prompt invocation failed ({e}); "
+                  f"using baked-in fallback prompt")
+
+    if response_text is None:
+        response_text = invoke_fallback_prompt(text)
+
+    return parse_classification(response_text)
+
+
+def parse_classification(response_text):
+    """Parse the model's JSON response; fail closed to Restricted on error."""
     try:
         response_text = response_text.strip()
         if response_text.startswith("```"):
@@ -176,9 +218,9 @@ def classify_content(text):
             response_text = response_text.strip()
 
         classification = json.loads(response_text)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, AttributeError, IndexError) as e:
         print(f"Failed to parse classification response: {e}")
-        print(f"Raw response: {response_text[:500]}")
+        print(f"Raw response: {str(response_text)[:500]}")
         classification = {
             "mnpi": False,
             "mnpi_confidence": 0.0,
