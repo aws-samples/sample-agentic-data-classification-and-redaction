@@ -464,6 +464,18 @@ Resources:
                 Action:
                   - bedrock:InvokeModel
                 Resource: '*'
+              # Invoke the externalized classification prompt from Bedrock
+              # Prompt Management (Converse with a prompt ARN requires RenderPrompt).
+              - Effect: Allow
+                Action:
+                  - bedrock:RenderPrompt
+                  - bedrock:GetPrompt
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:prompt/*'
+              # Read the SSM pointer that holds the active classification prompt ARN.
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Environment}/classification-prompt-arn'
               - Effect: Allow
                 Action:
                   - dynamodb:PutItem
@@ -504,7 +516,12 @@ Resources:
           PROJECT_NAME: !Ref ProjectName
           PROCESSED_BUCKET: !Ref ProcessedBucket
           CLASSIFICATION_TABLE: !Ref ClassificationMetadataTable
+          # Fallback model used only if the managed prompt can't be rendered.
           BEDROCK_MODEL_ID: !Ref BedrockModelId
+          # SSM parameter holding the ARN of the externalized classification
+          # prompt (Bedrock Prompt Management). Populated post-deploy by
+          # scripts/seed-classification-prompt.py.
+          CLASSIFICATION_PROMPT_PARAM: !Sub '/${ProjectName}/${Environment}/classification-prompt-arn'
           OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
           OPENSEARCH_INDEX: classified-content
 

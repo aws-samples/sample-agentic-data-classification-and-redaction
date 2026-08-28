@@ -131,9 +131,32 @@ for BUCKET in "${LAMBDA_BUCKET}" "${OLD_BUCKET}"; do
   fi
 done
 
-# Step 6: Verify
+# Step 6: Delete the externalized classification prompt + SSM pointer
+# (created outside CloudFormation by seed-classification-prompt.py)
 echo ""
-echo "Step 6: Verifying cleanup..."
+echo "Step 6: Deleting classification prompt and SSM pointer..."
+PROMPT_NAME="${PROJECT}-${ENVIRONMENT}-classification"
+PROMPT_PARAM="/${PROJECT}/${ENVIRONMENT}/classification-prompt-arn"
+
+# Delete the SSM parameter
+aws ssm delete-parameter --name "${PROMPT_PARAM}" --region "${REGION}" 2>/dev/null \
+  && echo "  Deleted SSM parameter ${PROMPT_PARAM}." \
+  || echo "  SSM parameter ${PROMPT_PARAM} not found, skipping."
+
+# Find and delete the managed prompt by name
+PROMPT_ID=$(aws bedrock-agent list-prompts --region "${REGION}" \
+  --query "promptSummaries[?name=='${PROMPT_NAME}'].id | [0]" --output text 2>/dev/null)
+if [ -n "${PROMPT_ID}" ] && [ "${PROMPT_ID}" != "None" ]; then
+  aws bedrock-agent delete-prompt --prompt-identifier "${PROMPT_ID}" --region "${REGION}" 2>/dev/null \
+    && echo "  Deleted prompt ${PROMPT_NAME} (${PROMPT_ID})." \
+    || echo "  Could not delete prompt ${PROMPT_NAME}, skipping."
+else
+  echo "  Prompt ${PROMPT_NAME} not found, skipping."
+fi
+
+# Step 7: Verify
+echo ""
+echo "Step 7: Verifying cleanup..."
 REMAINING=$(aws cloudformation list-stacks --region "${REGION}" --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE --query "StackSummaries[?contains(StackName,'${PROJECT}')].StackName" --output text 2>/dev/null)
 if [ -n "${REMAINING}" ] && [ "${REMAINING}" != "None" ]; then
   echo "  WARNING: Some stacks still exist: ${REMAINING}"
